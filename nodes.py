@@ -898,6 +898,415 @@ class FramePackSingleFrameSampler:
 
         return ({"samples": generated_latents / vae_scaling_factor},)
 
+# port from https://github.com/red-polo/FramePackLoop
+class FramePackLoopSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("FramePackMODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
+                "steps": ("INT", {"default": 30, "min": 1}),
+                "use_teacache": ("BOOLEAN", {"default": True, "tooltip": "Use teacache for faster sampling."}),
+                "teacache_rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The threshold for the relative L1 loss."}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "guidance_scale": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 32.0, "step": 0.01}),
+                "shift": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "latent_window_size": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1, "tooltip": "The size of the latent window to use for sampling."}),
+                "total_second_length": ("FLOAT", {"default": 5, "min": 0.1, "max": 120, "step": 0.1, "tooltip": "The total length of the video in seconds."}),
+                "gpu_memory_preservation": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 128.0, "step": 0.1, "tooltip": "The amount of GPU memory to preserve."}),
+                "sampler": (["unipc_bh1", "unipc_bh2"],
+                    {
+                        "default": 'unipc_bh1'
+                    }),
+            },
+            "optional": {
+                "image_embeds": ("CLIP_VISION_OUTPUT", ),
+                "end_latent": ("LATENT", {"tooltip": "end Latents to use for image2video"} ),
+                "end_image_embeds": ("CLIP_VISION_OUTPUT", {"tooltip": "end Image's clip embeds"} ),
+                "embed_interpolation": (["disabled", "weighted_average", "linear"], {"default": 'disabled', "tooltip": "Image embedding interpolation type. If linear, will smoothly interpolate with time, else it'll be weighted average with the specified weight."}),
+                "start_embed_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Weighted average constant for image embed interpolation. If end image is not set, the embed's strength won't be affected"}),
+                "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "connection_second_length": ("FLOAT", {"default": 1.0, "min": 1, "max": 5, "step": 0.1, "tooltip": "The connection length of the video in seconds."}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", "INT", "INT")
+    RETURN_NAMES = ("samples", "start_frames", "end_frames")
+    FUNCTION = "process"
+    CATEGORY = "FramePackWrapper"
+
+    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, steps, cfg,
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, image_embeds=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0, connection_second_length=1.0):
+        main_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
+        main_latent_sections = int(max(round(main_latent_sections), 1))
+        connection_latent_sections = (connection_second_length * 30) / (latent_window_size * 4)
+        connection_latent_sections = int(max(round(connection_second_length), 1))
+        total_latent_sections = main_latent_sections + connection_latent_sections
+        print("total_latent_sections: ", total_latent_sections)
+        padding_second_length = 1
+
+        transformer = model["transformer"]
+        base_dtype = model["dtype"]
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        mm.unload_all_models()
+        mm.cleanup_models()
+        mm.soft_empty_cache()
+
+        if start_latent is not None:
+            start_latent = start_latent["samples"] * vae_scaling_factor
+        if initial_samples is not None:
+            initial_samples = initial_samples["samples"] * vae_scaling_factor
+        if end_latent is not None:
+            end_latent = end_latent["samples"] * vae_scaling_factor
+        has_end_image = end_latent is not None
+        print("start_latent", start_latent.shape)
+        B, C, T, H, W = start_latent.shape
+
+        if image_embeds is not None:
+            start_image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(device, base_dtype)
+
+        if has_end_image:
+            assert end_image_embeds is not None
+            end_image_encoder_last_hidden_state = end_image_embeds["last_hidden_state"].to(device, base_dtype)
+        else:
+            if image_embeds is not None:
+                end_image_encoder_last_hidden_state = torch.zeros_like(start_image_encoder_last_hidden_state)
+
+        llama_vec = positive[0][0].to(device, base_dtype)
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
+
+        if not math.isclose(cfg, 1.0):
+            llama_vec_n = negative[0][0].to(device, base_dtype)
+            clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
+        else:
+            llama_vec_n = torch.zeros_like(llama_vec, device=device)
+            clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
+
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+
+        # Sampling
+
+        rnd = torch.Generator("cpu").manual_seed(seed)
+
+        num_frames = latent_window_size * 4 - 3
+
+        comfy_model = HyVideoModel(
+                HyVideoModelConfig(base_dtype),
+                model_type=comfy.model_base.ModelType.FLOW,
+                device=device,
+            )
+
+        patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, torch.device("cpu"))
+        from latent_preview import prepare_callback
+        callback = prepare_callback(patcher, steps)
+
+        move_model_to_device_with_memory_preservation(transformer, target_device=device, preserved_memory_gb=gpu_memory_preservation)
+
+        ##メイン作成
+
+        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
+
+        total_generated_latent_frames = 0
+
+        latent_paddings_list = list(reversed(range(main_latent_sections)))
+        latent_paddings = latent_paddings_list.copy()  # Create a copy for iteration
+
+        if main_latent_sections > 4:
+            # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
+            # items looks better than expanding it when total_latent_sections > 4
+            # One can try to remove below trick and just
+            # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
+            latent_paddings = [3] + [2] * (main_latent_sections - 3) + [1, 0]
+            latent_paddings_list = latent_paddings.copy()
+
+        for i, latent_padding in enumerate(latent_paddings):
+            print(f"latent_padding: {latent_padding}")
+            is_last_section = latent_padding == 0
+            is_first_section = latent_padding == latent_paddings[0]
+            latent_padding_init_size = int(padding_second_length * latent_window_size)
+
+            latent_padding_size = (latent_padding * latent_window_size) + latent_padding_init_size
+
+
+            if image_embeds is not None:
+                if embed_interpolation != "disabled":
+                    if embed_interpolation == "linear":
+                        if main_latent_sections <= 1:
+                            frac = 1.0  # Handle case with only one section
+                        else:
+                            frac = 1 - i / (main_latent_sections - 1)  # going backwards
+                    else:
+                        frac = start_embed_strength if has_end_image else 1.0
+
+                    image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * frac + (1 - frac) * end_image_encoder_last_hidden_state
+                else:
+                    image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * start_embed_strength
+            else:
+                image_encoder_last_hidden_state = None
+
+            print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
+
+            start_latent_frames = T  # 0 or 1
+            indices = torch.arange(0, sum([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+
+            clean_latents_pre = start_latent.to(history_latents)
+            clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+
+            # Use end image latent for the first section if provided
+            if has_end_image and is_first_section:
+                clean_latents_post = end_latent.to(history_latents)
+                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+
+            #vid2vid WIP
+
+            if initial_samples is not None:
+                total_length = initial_samples.shape[2]
+
+                # Get the max padding value for normalization
+                max_padding = max(latent_paddings_list)
+
+                if is_last_section:
+                    # Last section should capture the end of the sequence
+                    start_idx = max(0, total_length - latent_window_size)
+                else:
+                    # Calculate windows that distribute more evenly across the sequence
+                    # This normalizes the padding values to create appropriate spacing
+                    if max_padding > 0:  # Avoid division by zero
+                        progress = (max_padding - latent_padding) / max_padding
+                        start_idx = int(progress * max(0, total_length - latent_window_size))
+                    else:
+                        start_idx = 0
+
+                end_idx = min(start_idx + latent_window_size, total_length)
+                print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
+                input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
+
+
+            if use_teacache:
+                transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
+            else:
+                transformer.initialize_teacache(enable_teacache=False)
+
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
+                generated_latents = sample_hunyuan(
+                    transformer=transformer,
+                    sampler=sampler,
+                    initial_latent=input_init_latents if initial_samples is not None else None,
+                    strength=denoise_strength,
+                    width=W * 8,
+                    height=H * 8,
+                    frames=num_frames,
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=guidance_scale,
+                    guidance_rescale=0,
+                    shift=shift if shift != 0 else None,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=device,
+                    dtype=base_dtype,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
+
+            #if is_last_section:
+            #    generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
+
+            total_generated_latent_frames += int(generated_latents.shape[2])
+            history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
+
+            real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
+
+            if is_last_section:
+                break
+
+        ##コネクション作成
+
+        #post_history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
+        post_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
+
+        post_total_generated_latent_frames = total_generated_latent_frames
+
+        latent_paddings_list = list(reversed(range(connection_latent_sections)))
+        latent_paddings = latent_paddings_list.copy()  # Create a copy for iteration
+
+        if connection_latent_sections > 4:
+            # In theory the latent_paddings should follow the above sequence, but it seems that duplicating some
+            # items looks better than expanding it when total_latent_sections > 4
+            # One can try to remove below trick and just
+            # use `latent_paddings = list(reversed(range(total_latent_sections)))` to compare
+            latent_paddings = [3] + [2] * (connection_latent_sections - 3) + [1, 0]
+            latent_paddings_list = latent_paddings.copy()
+
+        if total_latent_sections > 2:
+            N = 16
+        elif total_latent_sections == 2:
+            N= 15
+        else:
+            N=6
+
+        for i, latent_padding in enumerate(latent_paddings):
+            print(f"latent_padding: {latent_padding}")
+            is_last_section = latent_padding == 0
+            is_first_section = latent_padding == latent_paddings[0]
+            latent_padding_size = latent_padding * latent_window_size
+
+            indices = torch.arange(0, sum([1,latent_padding_size, latent_window_size, 1, 2, N])).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1,latent_padding_size, latent_window_size, 1, 2, N], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+            clean_latent_2x_indices = torch.cat([clean_latent_2x_indices], dim=1)
+            clean_latent_4x_indices = torch.cat([clean_latent_4x_indices], dim=1)
+
+
+            clean_latents_pre  = post_history_latents[:, :, -1:, :, :]
+            clean_latents_post, clean_latents_2x, clean_latents_4x = post_history_latents[:, :, :1 + 2 + N, :, :].split([1, 2, N], dim=2)
+
+            clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+            clean_latents_2x = torch.cat([clean_latents_2x], dim=2)
+            clean_latents_4x = torch.cat([clean_latents_4x], dim=2)
+
+            # Use end image latent for the first section if provided
+            if has_end_image and is_first_section:
+                clean_latents_post = end_latent.to(history_latents)
+                clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
+
+            #vid2vid WIP
+
+            if initial_samples is not None:
+                total_length = initial_samples.shape[2]
+
+                # Get the max padding value for normalization
+                max_padding = max(latent_paddings_list)
+
+                if is_last_section:
+                    # Last section should capture the end of the sequence
+                    start_idx = max(0, total_length - latent_window_size)
+                else:
+                    # Calculate windows that distribute more evenly across the sequence
+                    # This normalizes the padding values to create appropriate spacing
+                    if max_padding > 0:  # Avoid division by zero
+                        progress = (max_padding - latent_padding) / max_padding
+                        start_idx = int(progress * max(0, total_length - latent_window_size))
+                    else:
+                        start_idx = 0
+
+                end_idx = min(start_idx + latent_window_size, total_length)
+                print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
+                input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
+
+
+            if use_teacache:
+                transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
+            else:
+                transformer.initialize_teacache(enable_teacache=False)
+
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
+                generated_latents = sample_hunyuan(
+                    transformer=transformer,
+                    sampler=sampler,
+                    initial_latent=input_init_latents if initial_samples is not None else None,
+                    strength=denoise_strength,
+                    width=W * 8,
+                    height=H * 8,
+                    frames=num_frames,
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=guidance_scale,
+                    guidance_rescale=0,
+                    shift=shift if shift != 0 else None,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=device,
+                    dtype=base_dtype,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
+
+            #if is_last_section:
+            #    generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
+
+            post_total_generated_latent_frames += int(generated_latents.shape[2])
+            post_history_latents = torch.cat([generated_latents.to(post_history_latents), post_history_latents], dim=2)
+
+            post_real_history_latents = post_history_latents[:, :, :post_total_generated_latent_frames, :, :]
+
+            if is_last_section:
+                break
+
+        #1ループ作成
+        connection_hisotry_latents = post_real_history_latents[:,:,:latent_window_size*connection_latent_sections,:,:]
+        main_history_latents = real_history_latents[:,:,:latent_window_size*total_latent_sections,:,:]
+
+        final_latents = torch.cat([connection_hisotry_latents[:,:,-latent_window_size:,:,:],
+                                    main_history_latents,
+                                    connection_hisotry_latents,
+                                    main_history_latents[:,:,-latent_window_size:,:,:]],dim=2)
+
+        transformer.to(offload_device)
+        mm.soft_empty_cache()
+
+        return {"samples": final_latents / vae_scaling_factor}, latent_window_size * 4 - 3, latent_window_size * 4
+
+class SplitLoopFrames:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                 "start_frames": ("INT", {"default": 10, "min": 0, "step": 1, "tooltip": "Number of start frames to trim."}),
+                 "end_frames": ("INT", {"default": 10, "min": 0, "step": 1, "tooltip": "Number of end frames to trim."}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
+    FUNCTION = "process"
+    CATEGORY = "FramePackWrapper"
+
+    def process(self, images: torch.Tensor, start_frames: int, end_frames: int):
+        if start_frames > 0:
+            images = images[start_frames:]
+        if end_frames > 0:
+            images = images[:-end_frames]
+        return images,
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
     "FramePackSampler": FramePackSampler,
@@ -906,6 +1315,8 @@ NODE_CLASS_MAPPINGS = {
     "LoadFramePackModel": LoadFramePackModel,
     "FramePackLoraSelect": FramePackLoraSelect,
     "FramePackSingleFrameSampler": FramePackSingleFrameSampler,
+    "FramePackLoopSampler": FramePackLoopSampler,
+    "SplitLoopFrames": SplitLoopFrames,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
@@ -915,5 +1326,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadFramePackModel": "Load FramePackModel",
     "FramePackLoraSelect": "Select Lora",
     "FramePackSingleFrameSampler": "Single Frame Sampler",
+    "FramePackLoopSampler": "FramePackLoopSampler",
+    "SplitLoopFrames": "SplitLoopFrames",
     }
 
